@@ -1,0 +1,44 @@
+[package]
+name = "dkeys-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Неофициальный desktop-клиент D-KEYS"
+license = "MIT"
+repository = "https://github.com/iafilin/dkeys-desktop"
+homepage = "https://github.com/iafilin/dkeys-desktop"
+keywords = ["dkeys", "intercom", "webrtc", "gpui"]
+categories = ["gui"]
+
+[dependencies]
+anyhow = "1.0"
+directories = "6.0"
+gpui = "0.2.2"
+open = "5.3"
+raw-window-handle = "0.6"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+unicode-segmentation = "1.12"
+urlencoding = "2.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics-types = "0.2.0"
+objc = "0.2.7"
+objc-foundation = "0.1.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wry = "0.57.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
+panic = "abort"
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = "warn"

@@ -1,0 +1,7 @@
+/target
+/dist
+/.tools
+/reference
+*.log
+*.pdb
+.DS_Store

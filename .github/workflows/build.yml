@@ -1,0 +1,94 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: D-KEYS-Desktop-windows-x86_64
+          - name: macOS Intel
+            os: macos-13
+            target: x86_64-apple-darwin
+            artifact: D-KEYS-Desktop-macos-x86_64
+          - name: macOS Apple Silicon
+            os: macos-14
+            target: aarch64-apple-darwin
+            artifact: D-KEYS-Desktop-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --default
+          rustup target add "${{ matrix.target }}"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --target "${{ matrix.target }}" -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked --target "${{ matrix.target }}"
+
+      - name: Build release
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          bash scripts/package-macos.sh "$RUNNER_TEMP/D-KEYS Desktop.app"
+          mkdir -p dist
+          ditto -c -k --keepParent "$RUNNER_TEMP/D-KEYS Desktop.app" "dist/${{ matrix.artifact }}.zip"
+
+      - name: Package Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $archive = "dist/${{ matrix.artifact }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/dkeys-desktop.exe" -DestinationPath $archive -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/*/*.zip --generate-notes
