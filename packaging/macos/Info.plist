@@ -8,6 +8,8 @@
     <string>D-KEYS Desktop</string>
     <key>CFBundleExecutable</key>
     <string>dkeys-desktop</string>
+    <key>CFBundleIconFile</key>
+    <string>icon.icns</string>
     <key>CFBundleIdentifier</key>
     <string>ru.dkeys.desktop</string>
     <key>CFBundleInfoDictionaryVersion</key>

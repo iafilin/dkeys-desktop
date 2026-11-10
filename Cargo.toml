@@ -10,6 +10,9 @@ homepage = "https://github.com/iafilin/dkeys-desktop"
 keywords = ["dkeys", "intercom", "webrtc", "gpui"]
 categories = ["gui"]
 
+[build-dependencies]
+winresource = "0.1"
+
 [dependencies]
 anyhow = "1.0"
 directories = "6.0"
