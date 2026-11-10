@@ -11,9 +11,10 @@ use gpui::{
     actions, div, img, prelude::*, px, rgb, rgba, size, white,
 };
 use input::TextInput;
-use model::{Broadcast, Key, Session};
+use model::{ArchiveLink, Broadcast, Key, Session};
 use native_webrtc::NativeWebView;
 use storage::Storage;
+use time::{OffsetDateTime, PrimitiveDateTime};
 
 actions!(dkeys, [Quit]);
 
@@ -35,6 +36,8 @@ enum Screen {
     Keys,
     Cameras,
     CameraView(String),
+    ArchivePicker(String),
+    ArchiveView { code: String, date: String },
     About,
 }
 
@@ -45,6 +48,7 @@ enum Busy {
     Refresh,
     Open(String),
     Camera(String),
+    Archive(String),
     Logout,
 }
 
@@ -66,6 +70,8 @@ struct DKeysApp {
     phone: Entity<TextInput>,
     pin: Entity<TextInput>,
     search: Entity<TextInput>,
+    archive_date: Entity<TextInput>,
+    archive_task: Option<String>,
     busy: Option<Busy>,
     status: Option<Status>,
     confirm_key: Option<String>,
@@ -108,6 +114,8 @@ impl DKeysApp {
                     .max_len(8)
             }),
             search: cx.new(|cx| TextInput::new(cx, "Поиск по адресу или названию").max_len(80)),
+            archive_date: cx.new(|cx| TextInput::new(cx, "ДД.ММ.ГГГГ ЧЧ:ММ").max_len(16)),
+            archive_task: None,
             busy: None,
             status: None,
             confirm_key: None,
@@ -384,9 +392,144 @@ impl DKeysApp {
         }
     }
 
+    fn open_archive_picker(&mut self, code: String, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(camera) = self.cameras.iter().find(|camera| camera.code == code) else {
+            return;
+        };
+        if camera.archive_days().is_none() {
+            self.set_status("Для этой камеры онлайн-архив недоступен", true, cx);
+            return;
+        }
+        let now = archive_now_string();
+        self.archive_date
+            .update(cx, |input, cx| input.set_value(&now, cx));
+        self.screen = Screen::ArchivePicker(code);
+        self.status = None;
+        cx.notify();
+    }
+
+    fn set_archive_day(&mut self, days: i64, cx: &mut Context<Self>) {
+        let date = (archive_now() - time::Duration::days(days))
+            .format(ARCHIVE_INPUT_FORMAT)
+            .unwrap_or_default();
+        self.archive_date
+            .update(cx, |input, cx| input.set_value(&date, cx));
+        self.status = None;
+        cx.notify();
+    }
+
+    fn open_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Screen::ArchivePicker(code) = &self.screen else {
+            return;
+        };
+        let code = code.clone();
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let Some(camera) = self
+            .cameras
+            .iter()
+            .find(|camera| camera.code == code)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(days) = camera.archive_days() else {
+            self.set_status("Для этой камеры онлайн-архив недоступен", true, cx);
+            return;
+        };
+        let input_date = self.archive_date.read(cx).value();
+        let date_view = match archive_api_date(&input_date, days) {
+            Ok(date) => date,
+            Err(error) => {
+                self.set_status(error, true, cx);
+                return;
+            }
+        };
+        self.busy = Some(Busy::Archive(code.clone()));
+        self.status = None;
+        cx.notify();
+        let api = self.api.clone();
+        let weak_window = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { api.online_archive_link(&session, &camera, &date_view) })
+                .await;
+            this.update(cx, |app, cx| {
+                app.busy = None;
+                match result {
+                    Ok(link) => {
+                        let entity_id = cx.entity_id();
+                        weak_window
+                            .update(cx, |_, window, cx| {
+                                app.open_archive_view(
+                                    code.clone(),
+                                    input_date.clone(),
+                                    link,
+                                    window,
+                                    entity_id,
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    }
+                    Err(error) => app.set_status(format!("{error:#}"), true, cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_archive_view(
+        &mut self,
+        code: String,
+        date: String,
+        link: ArchiveLink,
+        window: &mut Window,
+        entity_id: gpui::EntityId,
+        cx: &mut App,
+    ) {
+        self.stop_webrtc();
+        let task = link.task.clone();
+        match native_webrtc::attach(window, &link.authenticated_url()) {
+            Ok(view) => {
+                self.native_webrtc = Some(view);
+                self.archive_task = Some(task);
+                self.screen = Screen::ArchiveView { code, date };
+                self.status = None;
+                cx.notify(entity_id);
+            }
+            Err(error) => {
+                let api = self.api.clone();
+                std::thread::spawn(move || {
+                    let _ = api.close_archive_session(&task);
+                });
+                self.status = Some(Status {
+                    text: error,
+                    error: true,
+                });
+                cx.notify(entity_id);
+            }
+        }
+    }
+
     fn stop_webrtc(&mut self) {
         if let Some(view) = self.native_webrtc.take() {
             native_webrtc::detach(view);
+        }
+        if let Some(task) = self.archive_task.take() {
+            let api = self.api.clone();
+            std::thread::spawn(move || {
+                let _ = api.close_archive_session(&task);
+            });
         }
     }
 
@@ -454,7 +597,10 @@ impl DKeysApp {
     }
 
     fn close_about(&mut self, cx: &mut Context<Self>) {
-        self.screen = if matches!(self.about_return, Screen::CameraView(_)) {
+        self.screen = if matches!(
+            self.about_return,
+            Screen::CameraView(_) | Screen::ArchivePicker(_) | Screen::ArchiveView { .. }
+        ) {
             Screen::Cameras
         } else {
             self.about_return.clone()
@@ -505,6 +651,7 @@ impl DKeysApp {
             Busy::Refresh => Some("Обновляем данные…"),
             Busy::Open(_) => Some("Отправляем команду…"),
             Busy::Camera(_) => Some("Подключаем камеру…"),
+            Busy::Archive(_) => Some("Получаем онлайн-архив…"),
             Busy::Logout => Some("Выходим…"),
         }
     }
@@ -856,14 +1003,26 @@ impl DKeysApp {
                             .py_3()
                             .rounded_lg()
                             .text_color(
-                                if matches!(self.screen, Screen::Cameras | Screen::CameraView(_)) {
+                                if matches!(
+                                    self.screen,
+                                    Screen::Cameras
+                                        | Screen::CameraView(_)
+                                        | Screen::ArchivePicker(_)
+                                        | Screen::ArchiveView { .. }
+                                ) {
                                     rgb(0xffffff)
                                 } else {
                                     rgba(0xffffffaa)
                                 },
                             )
                             .when(
-                                matches!(self.screen, Screen::Cameras | Screen::CameraView(_)),
+                                matches!(
+                                    self.screen,
+                                    Screen::Cameras
+                                        | Screen::CameraView(_)
+                                        | Screen::ArchivePicker(_)
+                                        | Screen::ArchiveView { .. }
+                                ),
                                 |element| element.bg(rgba(0xffffff20)),
                             )
                             .hover(|style| style.bg(rgba(0xffffff12)).text_color(white()))
@@ -1055,7 +1214,7 @@ impl DKeysApp {
                                     .child(
                                         about_section(
                                             "Возможности и ограничения",
-                                            "Вход по SMS, список ключей, удалённое открытие и просмотр камер по WebRTC внутри приложения. На macOS используется WebKit, на Windows — WebView2. Внешний браузер, RTSP и FFmpeg для просмотра не требуются. Доступность оборудования зависит от серверов D-KEYS и вашей учётной записи.",
+                                            "Вход по SMS, список ключей, удалённое открытие, живые камеры по WebRTC и онлайн-архив с выбором даты внутри приложения. На macOS используется WebKit, на Windows — WebView2. Внешний браузер, RTSP и FFmpeg для просмотра не требуются. Доступность оборудования и архивных записей зависит от серверов D-KEYS и вашей учётной записи.",
                                         )
                                     )
                                     .children(self.status.as_ref().map(render_status)),
@@ -1190,7 +1349,9 @@ impl DKeysApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let code = camera.code.clone();
+        let archive_code = camera.code.clone();
         let connecting = matches!(self.busy.as_ref(), Some(Busy::Camera(open_code)) if open_code == &camera.code);
+        let archive_connecting = matches!(self.busy.as_ref(), Some(Busy::Archive(open_code)) if open_code == &camera.code);
         div()
             .w(px(402.))
             .min_h(px(180.))
@@ -1273,35 +1434,226 @@ impl DKeysApp {
                             ))),
                     )
                     .child(
-                        action_button(
-                            ElementId::from(("watch", index)),
-                            if connecting {
-                                "Подключаем…"
-                            } else {
-                                "Смотреть"
-                            },
-                            true,
-                        )
-                        .when(connecting, |button| button.opacity(0.55))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |app, _, window, cx| {
-                                app.open_camera(code.clone(), window, cx);
-                            }),
-                        ),
+                        div()
+                            .flex()
+                            .gap_2()
+                            .when(camera.archive_days().is_some(), |buttons| {
+                                buttons.child(
+                                    action_button(
+                                        ElementId::from(("archive", index)),
+                                        if archive_connecting {
+                                            "Загрузка…"
+                                        } else {
+                                            "Архив"
+                                        },
+                                        false,
+                                    )
+                                    .when(archive_connecting, |button| button.opacity(0.55))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |app, _, _, cx| {
+                                            app.open_archive_picker(archive_code.clone(), cx);
+                                        }),
+                                    ),
+                                )
+                            })
+                            .child(
+                                action_button(
+                                    ElementId::from(("watch", index)),
+                                    if connecting {
+                                        "Подключаем…"
+                                    } else {
+                                        "Смотреть"
+                                    },
+                                    true,
+                                )
+                                .when(connecting, |button| button.opacity(0.55))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |app, _, window, cx| {
+                                        app.open_camera(code.clone(), window, cx);
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_archive_picker(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (title, days) = if let Screen::ArchivePicker(code) = &self.screen {
+            self.cameras
+                .iter()
+                .find(|camera| &camera.code == code)
+                .map(|camera| {
+                    (
+                        camera.display_title().to_owned(),
+                        camera.archive_days().unwrap_or_default(),
+                    )
+                })
+                .unwrap_or_else(|| ("Камера".to_owned(), 0))
+        } else {
+            ("Камера".to_owned(), 0)
+        };
+        let loading = matches!(self.busy.as_ref(), Some(Busy::Archive(_)));
+        div()
+            .size_full()
+            .flex()
+            .bg(rgb(BACKGROUND))
+            .child(self.render_sidebar(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .h(px(HEADER_HEIGHT))
+                            .px_7()
+                            .flex()
+                            .items_center()
+                            .gap_4()
+                            .bg(white())
+                            .border_b_1()
+                            .border_color(rgb(BORDER))
+                            .child(text_button("close-archive-picker", "← Назад").on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|app, _, _, cx| app.close_camera(cx)),
+                            ))
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT))
+                                    .child("Онлайн-архив"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .p_7()
+                            .child(
+                                div()
+                                    .w(px(560.))
+                                    .p_7()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_5()
+                                    .rounded_xl()
+                                    .bg(white())
+                                    .border_1()
+                                    .border_color(rgb(BORDER))
+                                    .shadow_sm()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_2xl()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(TEXT))
+                                                    .child("Выберите дату и время"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(rgb(MUTED))
+                                                    .child(title),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(rgb(TEXT))
+                                                    .child("Начало записи"),
+                                            )
+                                            .child(input_container(self.archive_date.clone()))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(MUTED))
+                                                    .child("Формат: ДД.ММ.ГГГГ ЧЧ:ММ"),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_3()
+                                            .child(
+                                                action_button("archive-today", "Сегодня", false)
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(|app, _, _, cx| app.set_archive_day(0, cx)),
+                                                    ),
+                                            )
+                                            .child(
+                                                action_button("archive-yesterday", "Вчера", false)
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(|app, _, _, cx| app.set_archive_day(1, cx)),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .p_4()
+                                            .rounded_lg()
+                                            .bg(rgb(0xedf3fb))
+                                            .text_sm()
+                                            .text_color(rgb(NAVY))
+                                            .child(format!(
+                                                "Доступны записи за последние {days} дн. Время выбирается по местному часовому поясу."
+                                            )),
+                                    )
+                                    .children(self.status.as_ref().map(render_status))
+                                    .child(
+                                        action_button(
+                                            "open-archive",
+                                            if loading { "Получаем ссылку…" } else { "Смотреть архив" },
+                                            true,
+                                        )
+                                        .when(loading, |button| button.opacity(0.55))
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|app, _, window, cx| app.open_archive(window, cx)),
+                                        ),
+                                    ),
+                            ),
                     ),
             )
     }
 
     fn render_camera_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (title, protocol) = if let Screen::CameraView(code) = &self.screen {
-            self.cameras
+        let (title, protocol) = match &self.screen {
+            Screen::CameraView(code) => self
+                .cameras
                 .iter()
                 .find(|camera| &camera.code == code)
                 .map(|camera| (camera.display_title().to_owned(), camera.protocol.clone()))
-                .unwrap_or_else(|| ("Камера".to_owned(), String::new()))
-        } else {
-            ("Камера".to_owned(), String::new())
+                .unwrap_or_else(|| ("Камера".to_owned(), String::new())),
+            Screen::ArchiveView { code, date } => self
+                .cameras
+                .iter()
+                .find(|camera| &camera.code == code)
+                .map(|camera| {
+                    (
+                        format!("{} · {date}", camera.display_title()),
+                        "Онлайн-архив".to_owned(),
+                    )
+                })
+                .unwrap_or_else(|| (format!("Онлайн-архив · {date}"), String::new())),
+            _ => ("Камера".to_owned(), String::new()),
         };
         let frame: Option<std::sync::Arc<gpui::RenderImage>> = None;
         let has_frame = frame.is_some();
@@ -1568,6 +1920,8 @@ impl Render for DKeysApp {
                 Screen::Keys => self.render_keys(cx).into_any_element(),
                 Screen::Cameras => self.render_cameras(cx).into_any_element(),
                 Screen::CameraView(_) => self.render_camera_view(cx).into_any_element(),
+                Screen::ArchivePicker(_) => self.render_archive_picker(cx).into_any_element(),
+                Screen::ArchiveView { .. } => self.render_camera_view(cx).into_any_element(),
                 Screen::About => self.render_about(cx).into_any_element(),
             })
             .children(
@@ -1757,6 +2111,37 @@ fn ellipsize(text: &str, max_chars: usize) -> String {
     }
 }
 
+const ARCHIVE_INPUT_FORMAT: &[time::format_description::FormatItem<'static>] =
+    time::macros::format_description!("[day].[month].[year] [hour]:[minute]");
+const ARCHIVE_API_FORMAT: &[time::format_description::FormatItem<'static>] =
+    time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+
+fn archive_now() -> PrimitiveDateTime {
+    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    PrimitiveDateTime::new(now.date(), now.time())
+}
+
+fn archive_now_string() -> String {
+    archive_now()
+        .format(ARCHIVE_INPUT_FORMAT)
+        .unwrap_or_default()
+}
+
+fn archive_api_date(input: &str, days: u32) -> Result<String, String> {
+    let selected = PrimitiveDateTime::parse(input.trim(), ARCHIVE_INPUT_FORMAT)
+        .map_err(|_| "Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ".to_owned())?;
+    let now = archive_now();
+    if selected > now {
+        return Err("Дата архива не может быть в будущем".to_owned());
+    }
+    if selected < now - time::Duration::days(i64::from(days)) {
+        return Err(format!("Архив доступен только за последние {days} дн."));
+    }
+    selected
+        .format(ARCHIVE_API_FORMAT)
+        .map_err(|_| "Не удалось подготовить дату архива".to_owned())
+}
+
 fn main() {
     Application::new().run(|cx: &mut App| {
         cx.bind_keys(input::bindings());
@@ -1805,7 +2190,10 @@ fn main() {
                         window.focus(&app.search.focus_handle(cx));
                         app.refresh_keys(cx);
                     }
-                    Screen::Cameras | Screen::CameraView(_) => app.refresh_keys(cx),
+                    Screen::Cameras
+                    | Screen::CameraView(_)
+                    | Screen::ArchivePicker(_)
+                    | Screen::ArchiveView { .. } => app.refresh_keys(cx),
                     Screen::About => {}
                 }
             })

@@ -5,8 +5,8 @@ use reqwest::blocking::{Client, Response};
 use serde::de::DeserializeOwned;
 
 use crate::model::{
-    ApiEnvelope, AuthData, Broadcast, Key, MqttData, OpenResult, OptionData, ServerData, Session,
-    VideoLink,
+    ApiEnvelope, ArchiveLink, AuthData, Broadcast, Key, MqttData, OpenResult, OptionData,
+    ServerData, Session, VideoLink,
 };
 
 const DEFAULT_MDE_URL: &str = "https://mde.s-m-d.ru:38257/DKeys_app_3/MAIN.php/";
@@ -160,6 +160,61 @@ impl DkeysApi {
             .data
             .filter(|link| !link.url.is_empty())
             .ok_or_else(|| anyhow!("Сервер не вернул ссылку на видеопоток"))
+    }
+
+    pub fn online_archive_link(
+        &self,
+        session: &Session,
+        broadcast: &Broadcast,
+        date_view: &str,
+    ) -> Result<ArchiveLink> {
+        let server_url = if matches!(broadcast.server.as_str(), "L3" | "l3") {
+            &session.l3_url
+        } else {
+            &session.l6_url
+        };
+        let mut params = self.params("getLinkVideoArchiveOnline", &session.phone, &session.token);
+        params.insert("codeMP".to_owned(), broadcast.code_mp.clone());
+        params.insert("dateView".to_owned(), date_view.to_owned());
+        let response = self.post_json(
+            &format!(
+                "{}/app/getLinkVideoArchiveOnline",
+                server_url.trim_end_matches('/')
+            ),
+            &params,
+        )?;
+        let envelope: ApiEnvelope<ArchiveLink> = decode(response)?;
+        ensure_success(&envelope)?;
+        if let Some(warning) = envelope
+            .warning
+            .as_ref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            return Err(anyhow!(warning.clone()));
+        }
+        envelope
+            .data
+            .filter(|link| !link.link.is_empty() && !link.task.is_empty())
+            .ok_or_else(|| anyhow!("Сервер не вернул ссылку на онлайн-архив"))
+    }
+
+    pub fn close_archive_session(&self, task: &str) -> Result<()> {
+        let response = self
+            .client
+            .delete(format!(
+                "http://01playbackarh.d-keys.info:4459/api/v1/session/end/{}",
+                urlencoding::encode(task)
+            ))
+            .send()
+            .context("Не удалось закрыть сессию онлайн-архива")?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "Сервер не подтвердил закрытие сессии архива: HTTP {}",
+                response.status()
+            ))
+        }
     }
 
     pub fn open_door(&self, session: &Session, key: &Key) -> Result<OpenResult> {

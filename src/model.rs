@@ -169,6 +169,8 @@ pub struct Broadcast {
     pub uid: String,
     #[serde(rename = "Online", default)]
     pub online: i32,
+    #[serde(rename = "recordStoragePeriod", default)]
+    pub record_storage_period: String,
 }
 
 impl Broadcast {
@@ -185,6 +187,49 @@ impl Broadcast {
             "Адрес не указан"
         } else {
             &self.address
+        }
+    }
+
+    pub fn archive_days(&self) -> Option<u32> {
+        self.record_storage_period
+            .parse::<u32>()
+            .ok()
+            .filter(|days| *days > 0)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ArchiveLink {
+    #[serde(default)]
+    pub link: String,
+    #[serde(default)]
+    pub login: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(rename = "result", default)]
+    pub _result: String,
+    #[serde(default)]
+    pub task: String,
+}
+
+impl ArchiveLink {
+    pub fn authenticated_url(&self) -> String {
+        let url = if self.link.contains("://") {
+            self.link.clone()
+        } else {
+            format!("http://{}", self.link)
+        };
+        if self.login.is_empty() || url.contains('@') {
+            return url;
+        }
+        if let Some((scheme, address)) = url.split_once("://") {
+            format!(
+                "{scheme}://{}:{}@{address}",
+                urlencoding::encode(&self.login),
+                urlencoding::encode(&self.password)
+            )
+        } else {
+            url
         }
     }
 }
