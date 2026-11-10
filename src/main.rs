@@ -1,14 +1,18 @@
 mod api;
+mod archive;
 mod input;
 mod model;
 mod native_webrtc;
 mod storage;
 
 use api::{DkeysApi, normalize_phone};
+#[cfg(target_os = "macos")]
+use archive::ArchiveControl;
 use gpui::{
-    App, Application, Bounds, Context, ElementId, Entity, Focusable, FontWeight, KeyBinding,
-    MouseButton, SharedString, Stateful, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    actions, div, img, prelude::*, px, rgb, rgba, size, white,
+    App, Application, BorderStyle, Bounds, Context, Corners, Edges, ElementId, Entity, Focusable,
+    FontWeight, KeyBinding, MouseButton, PaintQuad, Pixels, SharedString, Stateful,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, actions, canvas, div, img, point,
+    prelude::*, px, rgb, rgba, size, white,
 };
 use input::TextInput;
 use model::{ArchiveLink, Broadcast, Key, Session};
@@ -72,6 +76,17 @@ struct DKeysApp {
     search: Entity<TextInput>,
     archive_date: Entity<TextInput>,
     archive_task: Option<String>,
+    #[cfg(target_os = "macos")]
+    archive_control: Option<archive::macos::AvPlayerControl>,
+    archive_events: Option<std::sync::mpsc::Receiver<archive::PlayerEvent>>,
+    archive_playlist: Option<archive::ArchivePlaylist>,
+    archive_position: f64,
+    archive_duration: f64,
+    archive_paused: bool,
+    archive_speed: f32,
+    archive_error: Option<String>,
+    archive_loading: bool,
+    timeline_bounds: std::sync::Arc<std::sync::Mutex<Option<Bounds<Pixels>>>>,
     busy: Option<Busy>,
     status: Option<Status>,
     confirm_key: Option<String>,
@@ -116,6 +131,17 @@ impl DKeysApp {
             search: cx.new(|cx| TextInput::new(cx, "Поиск по адресу или названию").max_len(80)),
             archive_date: cx.new(|cx| TextInput::new(cx, "ДД.ММ.ГГГГ ЧЧ:ММ").max_len(16)),
             archive_task: None,
+            #[cfg(target_os = "macos")]
+            archive_control: None,
+            archive_events: None,
+            archive_playlist: None,
+            archive_position: 0.0,
+            archive_duration: 0.0,
+            archive_paused: false,
+            archive_speed: 1.0,
+            archive_error: None,
+            archive_loading: false,
+            timeline_bounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
             busy: None,
             status: None,
             confirm_key: None,
@@ -498,25 +524,159 @@ impl DKeysApp {
         cx: &mut App,
     ) {
         self.stop_webrtc();
-        let task = link.task.clone();
-        match native_webrtc::attach(window, &link.authenticated_url()) {
-            Ok(view) => {
-                self.native_webrtc = Some(view);
-                self.archive_task = Some(task);
-                self.screen = Screen::ArchiveView { code, date };
-                self.status = None;
-                cx.notify(entity_id);
+        self.archive_task = Some(link.task.clone());
+        self.archive_loading = true;
+        self.archive_error = None;
+        self.archive_playlist = None;
+        self.archive_position = 0.0;
+        self.archive_duration = 0.0;
+        self.archive_paused = false;
+        self.archive_speed = 1.0;
+        self.screen = Screen::ArchiveView {
+            code: code.clone(),
+            date: date.clone(),
+        };
+        self.status = None;
+        cx.notify(entity_id);
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let task = link.task.clone();
+            match native_webrtc::attach(window, &link.authenticated_url()) {
+                Ok(view) => {
+                    self.native_webrtc = Some(view);
+                    self.archive_loading = false;
+                    cx.notify(entity_id);
+                }
+                Err(error) => {
+                    let api = self.api.clone();
+                    std::thread::spawn(move || {
+                        let _ = api.close_archive_session(&task);
+                    });
+                    self.archive_loading = false;
+                    self.archive_error = Some(error);
+                    cx.notify(entity_id);
+                }
             }
-            Err(error) => {
-                let api = self.api.clone();
-                std::thread::spawn(move || {
-                    let _ = api.close_archive_session(&task);
-                });
-                self.status = Some(Status {
-                    text: error,
-                    error: true,
-                });
-                cx.notify(entity_id);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let origin = link
+                .link
+                .split("/api/")
+                .next()
+                .unwrap_or("")
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .to_owned();
+            let playlist_url = format!("http://{origin}/api/v1/playlist/{}", link.task);
+            let initial_position = seconds_since_midnight(&date);
+            let api = self.api.clone();
+            let weak_window = window.window_handle();
+            cx.spawn(async move |this, cx| {
+                let playlist_text = cx
+                    .background_executor()
+                    .spawn(async move { api.archive_playlist_text(&playlist_url) })
+                    .await;
+                this.update(cx, |app, cx| {
+                    app.archive_loading = false;
+                    match playlist_text {
+                        Ok(text) => {
+                            let playlist = archive::parse_m3u8(&text);
+                            if playlist.segments.is_empty() {
+                                app.archive_error =
+                                    Some("Сервер не вернул записи за выбранные сутки".to_owned());
+                                cx.notify();
+                                return;
+                            }
+                            app.archive_duration = playlist.duration;
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let url = playlist_url.clone();
+                            let attached = weak_window
+                                .update(cx, |_, window, _| {
+                                    archive::macos::attach(window, &url, initial_position, tx)
+                                })
+                                .map_err(|_| "Окно закрыто".to_owned())
+                                .and_then(|result| result);
+                            match attached {
+                                Ok(control) => {
+                                    app.archive_control = Some(control);
+                                    app.archive_events = Some(rx);
+                                    app.archive_playlist = Some(playlist);
+                                    app.spawn_archive_pump(cx);
+                                    cx.notify();
+                                }
+                                Err(error) => {
+                                    app.archive_error = Some(error);
+                                    cx.notify();
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            app.archive_error =
+                                Some(format!("Не удалось загрузить архив: {error:#}"));
+                            cx.notify();
+                        }
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spawn_archive_pump(&mut self, cx: &mut Context<Self>) {
+        let Some(rx) = self.archive_events.take() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+                let mut events = Vec::new();
+                while let Ok(event) = rx.try_recv() {
+                    events.push(event);
+                }
+                let had_events = !events.is_empty();
+                let alive = this
+                    .update(cx, |app, cx| {
+                        if had_events {
+                            for event in events {
+                                app.apply_archive_event(event);
+                            }
+                            cx.notify();
+                        }
+                        app.archive_control.is_some()
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn apply_archive_event(&mut self, event: archive::PlayerEvent) {
+        match event {
+            archive::PlayerEvent::State {
+                position,
+                duration,
+                paused,
+                finished: _,
+            } => {
+                self.archive_position = position;
+                if duration > 0.0 {
+                    self.archive_duration = duration;
+                }
+                self.archive_paused = paused;
+            }
+            archive::PlayerEvent::Error(text) => {
+                self.archive_error = Some(text);
             }
         }
     }
@@ -524,6 +684,14 @@ impl DKeysApp {
     fn stop_webrtc(&mut self) {
         if let Some(view) = self.native_webrtc.take() {
             native_webrtc::detach(view);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.archive_control = None;
+            self.archive_events = None;
+            self.archive_playlist = None;
+            self.archive_error = None;
+            self.archive_loading = false;
         }
         if let Some(task) = self.archive_task.take() {
             let api = self.api.clone();
@@ -1739,6 +1907,289 @@ impl DKeysApp {
             )
     }
 
+    #[cfg(target_os = "macos")]
+    fn render_archive_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = match &self.screen {
+            Screen::ArchiveView { code, date } => self
+                .cameras
+                .iter()
+                .find(|camera| &camera.code == code)
+                .map(|camera| format!("{} · {date}", camera.display_title()))
+                .unwrap_or_else(|| format!("Онлайн-архив · {date}")),
+            _ => "Онлайн-архив".to_owned(),
+        };
+        let loading = self.archive_loading;
+        let error = self.archive_error.clone();
+        let has_player = self.archive_control.is_some();
+        let paused = self.archive_paused;
+        let speed = self.archive_speed;
+        let position = self.archive_position;
+        let duration = self.archive_duration;
+
+        let mut content = div()
+            .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(HEADER_HEIGHT))
+                    .px_7()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .bg(white())
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        text_button("close-camera", "← Назад").on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|app, _, _, cx| app.close_camera(cx)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child(title),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child("Онлайн-архив"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .m_7()
+                    .rounded_lg()
+                    .bg(rgb(0x050a12))
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(loading, |area| {
+                        area.child(
+                            div()
+                                .text_lg()
+                                .text_color(rgba(0xffffffbb))
+                                .child("Загружаем архив…"),
+                        )
+                    })
+                    .when(!loading && error.is_none() && !has_player, |area| {
+                        area.child(
+                            div()
+                                .text_lg()
+                                .text_color(rgba(0xffffffbb))
+                                .child("Подключаемся к видео…"),
+                        )
+                    })
+                    .when_some(error.clone(), |area, text| {
+                        area.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .max_w(px(480.))
+                                        .text_center()
+                                        .text_color(rgba(0xffb4b4ff))
+                                        .child(text),
+                                )
+                                .child(
+                                    text_button("retry-archive", "Повторить").on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|app, _, window, cx| {
+                                            let code = match &app.screen {
+                                                Screen::ArchiveView { code, .. } => code.clone(),
+                                                _ => return,
+                                            };
+                                            app.stop_webrtc();
+                                            app.screen = Screen::ArchivePicker(code);
+                                            app.open_archive(window, cx);
+                                        }),
+                                    ),
+                                ),
+                        )
+                    }),
+            );
+
+        if has_player {
+            let controls = div()
+                .px_7()
+                .pb_3()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    player_button(if paused { "⏵" } else { "⏸" })
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|app, _, _, cx| {
+                                if let Some(control) = app.archive_control.as_mut() {
+                                    if app.archive_paused {
+                                        control.play();
+                                    } else {
+                                        control.pause();
+                                    }
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
+                    player_pill("−15 с").on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|app, _, _, cx| {
+                            let target = (app.archive_position - 15.0).max(0.0);
+                            if let Some(control) = app.archive_control.as_mut() {
+                                control.seek(target);
+                                app.archive_position = target;
+                            }
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .child(
+                    player_pill("+15 с").on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|app, _, _, cx| {
+                            let target = (app.archive_position + 15.0)
+                                .min(app.archive_duration.max(0.0));
+                            if let Some(control) = app.archive_control.as_mut() {
+                                control.seek(target);
+                                app.archive_position = target;
+                            }
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .child(
+                    player_pill(&format!("×{speed}")).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|app, _, _, cx| {
+                            const SPEEDS: [f32; 4] = [1.0, 1.5, 2.0, 4.0];
+                            let next = SPEEDS
+                                .iter()
+                                .find(|&&value| value > app.archive_speed)
+                                .copied()
+                                .unwrap_or(SPEEDS[0]);
+                            app.archive_speed = next;
+                            if let Some(control) = app.archive_control.as_mut() {
+                                control.set_speed(next);
+                            }
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(TEXT))
+                        .child(format!(
+                            "{} / {}",
+                            archive::format_time(position),
+                            archive::format_time(duration)
+                        )),
+                );
+            content = content.child(controls).child(self.render_archive_timeline(cx));
+        }
+
+        div()
+            .size_full()
+            .flex()
+            .bg(rgb(BACKGROUND))
+            .child(self.render_sidebar(cx))
+            .child(content)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn render_archive_timeline(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let playlist = self.archive_playlist.clone();
+        let position = self.archive_position;
+        let duration = self.archive_duration;
+        let bounds_cell = self.timeline_bounds.clone();
+        div()
+            .mx_7()
+            .mb_5()
+            .h(px(48.))
+            .rounded_md()
+            .bg(rgb(0x0d1420))
+            .overflow_hidden()
+            .child(canvas(
+                move |bounds, _, _| {
+                    *bounds_cell.lock().unwrap() = Some(bounds);
+                    (playlist, position, duration)
+                },
+                |bounds, (playlist, position, duration), window, _| {
+                    let Some(playlist) = playlist else {
+                        return;
+                    };
+                    if playlist.segments.is_empty() || duration <= 0.0 {
+                        return;
+                    }
+                    let bar_height = px(8.0);
+                    let bar_y = bounds.center().y - bar_height / 2.0;
+                    for segment in &playlist.segments {
+                        let x = bounds.left() + bounds.width() * (segment.start / duration) as f32;
+                        let width = (bounds.width() * (segment.duration / duration) as f32)
+                            .max(px(1.0));
+                        let color = match segment.color {
+                            archive::SegmentColor::Recording => rgb(0xe5484d),
+                            archive::SegmentColor::Placeholder => rgb(0x2b3444),
+                            archive::SegmentColor::Unknown => rgb(0x3a4356),
+                        };
+                        window.paint_quad(PaintQuad {
+                            bounds: Bounds::new(point(x, bar_y), size(width, bar_height)),
+                            corner_radii: Corners::default(),
+                            background: color.into(),
+                            border_widths: Edges::default(),
+                            border_color: rgb(0x000000).into(),
+                            border_style: BorderStyle::default(),
+                        });
+                    }
+                    let thumb_x = bounds.left()
+                        + bounds.width() * ((position / duration).clamp(0.0, 1.0) as f32);
+                    window.paint_quad(PaintQuad {
+                        bounds: Bounds::new(
+                            point(thumb_x - px(7.0), bounds.center().y - px(7.0)),
+                            size(px(14.0), px(14.0)),
+                        ),
+                        corner_radii: Corners::all(px(7.0)),
+                        background: white().into(),
+                        border_widths: Edges::default(),
+                        border_color: rgb(0x000000).into(),
+                        border_style: BorderStyle::default(),
+                    });
+                },
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|app, event, _, cx| {
+                    let bounds = app.timeline_bounds.lock().unwrap().clone();
+                    if let Some(bounds) = bounds {
+                        if bounds.width() > px(0.0) && app.archive_duration > 0.0 {
+                            let fraction = ((event.position.x - bounds.left()) / bounds.width())
+                                .clamp(0.0, 1.0);
+                            let target = fraction * app.archive_duration;
+                            if let Some(control) = app.archive_control.as_mut() {
+                                control.seek(target);
+                                app.archive_position = target;
+                            }
+                            cx.notify();
+                        }
+                    }
+                }),
+            )
+    }
+
     fn render_key_card(&self, index: usize, key: &Key, cx: &mut Context<Self>) -> impl IntoElement {
         let code = key.code.clone();
         let opening =
@@ -1921,6 +2372,9 @@ impl Render for DKeysApp {
                 Screen::Cameras => self.render_cameras(cx).into_any_element(),
                 Screen::CameraView(_) => self.render_camera_view(cx).into_any_element(),
                 Screen::ArchivePicker(_) => self.render_archive_picker(cx).into_any_element(),
+                #[cfg(target_os = "macos")]
+                Screen::ArchiveView { .. } => self.render_archive_view(cx).into_any_element(),
+                #[cfg(not(target_os = "macos"))]
                 Screen::ArchiveView { .. } => self.render_camera_view(cx).into_any_element(),
                 Screen::About => self.render_about(cx).into_any_element(),
             })
@@ -2032,6 +2486,54 @@ fn text_button(id: &'static str, label: &'static str) -> Stateful<gpui::Div> {
         .text_color(rgb(BLUE))
         .hover(|style| style.bg(rgb(0xeaf2ff)))
         .child(label)
+}
+
+fn player_button(label: &'static str) -> Stateful<gpui::Div> {
+    div()
+        .id("player-transport")
+        .cursor_pointer()
+        .w(px(44.))
+        .h(px(44.))
+        .rounded_full()
+        .bg(rgb(0x3478e5))
+        .text_color(white())
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_lg()
+        .hover(|style| style.bg(rgb(0x2a63c4)))
+        .child(label)
+}
+
+fn player_pill(label: &str) -> Stateful<gpui::Div> {
+    div()
+        .id("player-pill")
+        .cursor_pointer()
+        .px_3()
+        .py_2()
+        .rounded_lg()
+        .bg(white())
+        .border_1()
+        .border_color(rgb(BORDER))
+        .text_sm()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(TEXT))
+        .hover(|style| style.bg(rgb(0xeaf2ff)))
+        .child(label.to_owned())
+}
+
+fn seconds_since_midnight(date: &str) -> f64 {
+    let time = date.split(' ').nth(1).unwrap_or("");
+    let mut parts = time.split(':');
+    let hours: f64 = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0.0);
+    let minutes: f64 = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0.0);
+    hours * 3600.0 + minutes * 60.0
 }
 
 fn about_section(title: &'static str, text: &'static str) -> impl IntoElement {
