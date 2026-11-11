@@ -202,8 +202,13 @@ impl Broadcast {
 pub struct ArchiveLink {
     #[serde(default)]
     pub link: String,
+    // Логин/пароль и authenticated_url() используются только в не-macOS
+    // ветке открытия архива (системный плеер); на macOS URL валидируется
+    // напрямую перед созданием AVPlayer.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     #[serde(default)]
     pub login: String,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     #[serde(default)]
     pub password: String,
     #[serde(rename = "result", default)]
@@ -213,6 +218,7 @@ pub struct ArchiveLink {
 }
 
 impl ArchiveLink {
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn authenticated_url(&self) -> String {
         let url = if self.link.contains("://") {
             self.link.clone()

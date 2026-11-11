@@ -36,6 +36,8 @@ const MUTED: u32 = 0x718096;
 const BORDER: u32 = 0xe1e7ef;
 const SIDEBAR_WIDTH: f32 = 240.0;
 const HEADER_HEIGHT: f32 = 84.0;
+// Используется только в нативных macOS/Windows-бэкендах (appkit, native_webrtc).
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 const CONTENT_MARGIN: f32 = 28.0;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -700,13 +702,13 @@ impl DKeysApp {
                 position,
                 duration,
                 paused,
-                finished: _,
+                finished,
             } => {
                 self.archive_position = position;
                 if duration > 0.0 {
                     self.archive_duration = duration;
                 }
-                self.archive_paused = paused;
+                self.archive_paused = paused || finished;
             }
             archive::PlayerEvent::Error(text) => {
                 self.archive_error = Some(text);
