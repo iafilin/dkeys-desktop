@@ -37,15 +37,7 @@ pub fn attach(window: &Window, url: &str) -> Result<NativeWebView, String> {
     let native_view = handle.ns_view.as_ptr() as *mut Object;
     unsafe {
         let configuration: *mut Object = msg_send![class!(WKWebViewConfiguration), new];
-        let mut frame: core_graphics_types::geometry::CGRect = msg_send![native_view, bounds];
-        frame.origin.x = f64::from(crate::SIDEBAR_WIDTH + crate::CONTENT_MARGIN);
-        frame.origin.y = f64::from(crate::CONTENT_MARGIN);
-        frame.size.width = (frame.size.width
-            - f64::from(crate::SIDEBAR_WIDTH + crate::CONTENT_MARGIN * 2.0))
-        .max(0.0);
-        frame.size.height = (frame.size.height
-            - f64::from(crate::HEADER_HEIGHT + crate::CONTENT_MARGIN * 2.0))
-        .max(0.0);
+        let frame = crate::appkit::content_frame(native_view);
         let webview: *mut Object = msg_send![class!(WKWebView), alloc];
         let webview: *mut Object =
             msg_send![webview, initWithFrame: frame configuration: configuration];

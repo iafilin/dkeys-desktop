@@ -1,8 +1,8 @@
 #![allow(unexpected_cfgs)]
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 
 use block::ConcreteBlock;
 use gpui::Window;
@@ -29,7 +29,8 @@ struct CMTime {
 
 unsafe impl objc::Encode for CMTime {
     fn encode() -> objc::Encoding {
-        "{CMTime=qiIq}"
+        // SAFETY: строка — корректное описание структуры CMTime.
+        unsafe { objc::Encoding::from_str("{CMTime=qiIq}") }
     }
 }
 
@@ -97,7 +98,8 @@ unsafe fn error_description(item: *mut Object) -> Option<String> {
     if description.is_null() {
         return Some("Неизвестная ошибка воспроизведения".to_owned());
     }
-    Some((*(description as *const NSString)).as_str().to_owned())
+    // SAFETY: указатель проверен на null выше, строка живёт в autorelease-пуле.
+    Some(unsafe { (*(description as *const NSString)).as_str() }.to_owned())
 }
 
 unsafe fn rate_of(player: *mut Object) -> f32 {
@@ -186,15 +188,13 @@ pub fn attach(
     };
     let native_view = handle.ns_view.as_ptr() as *mut Object;
     unsafe {
-        let mut frame: core_graphics_types::geometry::CGRect = msg_send![native_view, bounds];
-        frame.origin.x = f64::from(crate::SIDEBAR_WIDTH + crate::CONTENT_MARGIN);
-        frame.origin.y = f64::from(crate::CONTENT_MARGIN);
-        frame.size.width = (frame.size.width
-            - f64::from(crate::SIDEBAR_WIDTH + crate::CONTENT_MARGIN * 2.0))
-        .max(0.0);
-        frame.size.height = (frame.size.height
-            - f64::from(crate::HEADER_HEIGHT + crate::CONTENT_MARGIN * 2.0))
-        .max(0.0);
+        let url_string = NSString::from_str(playlist_url);
+        let url: *mut Object = msg_send![class!(NSURL), URLWithString: url_string];
+        if url.is_null() {
+            return Err("Некорректный адрес плейлиста архива".to_owned());
+        }
+
+        let frame = crate::appkit::content_frame(native_view);
 
         let host_view: *mut Object = msg_send![class!(NSView), alloc];
         let host_view: *mut Object = msg_send![host_view, initWithFrame: frame];
@@ -202,13 +202,9 @@ pub fn attach(
         let _: () = msg_send![host_view, setAutoresizingMask: 18usize];
         let _: () = msg_send![native_view, addSubview: host_view];
 
-        let url_string = NSString::from_str(playlist_url);
-        let url: *mut Object = msg_send![class!(NSURL), URLWithString: url_string];
-        if url.is_null() {
-            return Err("Некорректный адрес плейлиста архива".to_owned());
-        }
         let asset: *mut Object = msg_send![class!(AVURLAsset), alloc];
-        let asset: *mut Object = msg_send![asset, initWithURL: url options: std::ptr::null::<Object>()];
+        let asset: *mut Object =
+            msg_send![asset, initWithURL: url options: std::ptr::null::<Object>()];
         let item: *mut Object = msg_send![class!(AVPlayerItem), alloc];
         let item: *mut Object = msg_send![item, initWithAsset: asset];
         let _: () = msg_send![asset, release];
@@ -220,7 +216,13 @@ pub fn attach(
         let _: () = msg_send![layer, setVideoGravity: gravity];
         let host_layer: *mut Object = msg_send![host_view, layer];
         let _: () = msg_send![host_layer, addSublayer: layer];
-        let _: () = msg_send![layer, setFrame: frame];
+        // Кадр слоя — в координатах host_view, поэтому origin всегда (0, 0);
+        // autoresizing, чтобы видео тянулось за окном.
+        let mut layer_frame = frame;
+        layer_frame.origin.x = 0.0;
+        layer_frame.origin.y = 0.0;
+        let _: () = msg_send![layer, setFrame: layer_frame];
+        let _: () = msg_send![layer, setAutoresizingMask: 18usize];
         let _: () = msg_send![layer, release];
 
         let alive = Arc::new(AtomicBool::new(true));
@@ -233,36 +235,34 @@ pub fn attach(
             if !alive_for_block.load(Ordering::SeqCst) {
                 return;
             }
-            unsafe {
-                let player = player_addr as *mut Object;
-                let item = item_addr as *mut Object;
-                if is_failed(item) {
-                    let text = error_description(item)
-                        .unwrap_or_else(|| "Не удалось воспроизвести архив".to_owned());
-                    let _ = events.send(PlayerEvent::Error(text));
-                    return;
-                }
-                if status_code(item) != AV_PLAYER_ITEM_STATUS_READY {
-                    return;
-                }
-                if !started_for_block.swap(true, Ordering::SeqCst) {
-                    if initial_position > 0.0 {
-                        let time = CMTimeMakeWithSeconds(initial_position, 600);
-                        let _: () = msg_send![player, seekToTime: time];
-                    }
-                    let _: () = msg_send![player, play];
-                }
-                let position = seconds_of(cmtime_of(player, "currentTime"));
-                let duration = seconds_of(cmtime_of(item, "duration"));
-                let paused = rate_of(player) == 0.0;
-                let finished = duration > 0.0 && position >= duration - 0.3;
-                let _ = events.send(PlayerEvent::State {
-                    position,
-                    duration,
-                    paused,
-                    finished,
-                });
+            let player = player_addr as *mut Object;
+            let item = item_addr as *mut Object;
+            if is_failed(item) {
+                let text = error_description(item)
+                    .unwrap_or_else(|| "Не удалось воспроизвести архив".to_owned());
+                let _ = events.send(PlayerEvent::Error(text));
+                return;
             }
+            if status_code(item) != AV_PLAYER_ITEM_STATUS_READY {
+                return;
+            }
+            if !started_for_block.swap(true, Ordering::SeqCst) {
+                if initial_position > 0.0 {
+                    let time = CMTimeMakeWithSeconds(initial_position, 600);
+                    let _: () = msg_send![player, seekToTime: time];
+                }
+                let _: () = msg_send![player, play];
+            }
+            let position = seconds_of(cmtime_of(player, "currentTime"));
+            let duration = seconds_of(cmtime_of(item, "duration"));
+            let paused = rate_of(player) == 0.0;
+            let finished = duration > 0.0 && position >= duration - 0.3;
+            let _ = events.send(PlayerEvent::State {
+                position,
+                duration,
+                paused,
+                finished,
+            });
         })
         .copy();
         let interval = CMTimeMakeWithSeconds(0.5, 1);
@@ -270,7 +270,7 @@ pub fn attach(
             player,
             addPeriodicTimeObserverForInterval: interval
             queue: std::ptr::null_mut::<Object>()
-            usingBlock: block
+            usingBlock: &*block
         ];
 
         Ok(AvPlayerControl {

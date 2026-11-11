@@ -38,15 +38,16 @@ pub fn parse_m3u8(text: &str) -> ArchivePlaylist {
                 .split(',')
                 .next()
                 .and_then(|value| value.trim().parse::<f64>().ok());
-        } else if !line.is_empty() && !line.starts_with('#') {
-            if let Some(duration) = pending_duration.take() {
-                segments.push(Segment {
-                    start: cursor,
-                    duration,
-                    color: pending_color.take().unwrap_or(SegmentColor::Unknown),
-                });
-                cursor += duration;
-            }
+        } else if !line.is_empty()
+            && !line.starts_with('#')
+            && let Some(duration) = pending_duration.take()
+        {
+            segments.push(Segment {
+                start: cursor,
+                duration,
+                color: pending_color.take().unwrap_or(SegmentColor::Unknown),
+            });
+            cursor += duration;
         }
     }
     ArchivePlaylist {
@@ -75,7 +76,12 @@ pub trait ArchiveControl: Send {
 
 pub fn format_time(seconds: f64) -> String {
     let total = seconds.max(0.0).round() as u64;
-    format!("{:02}:{:02}:{:02}", total / 3600, (total / 60) % 60, total % 60)
+    format!(
+        "{:02}:{:02}:{:02}",
+        total / 3600,
+        (total / 60) % 60,
+        total % 60
+    )
 }
 
 #[cfg(test)]

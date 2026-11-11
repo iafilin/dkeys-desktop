@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -92,4 +92,6 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          # gh без git-репозитория в job'е падает; GH_REPO решает это без checkout
+          GH_REPO: ${{ github.repository }}
         run: gh release create "${GITHUB_REF_NAME}" dist/*/*.zip --generate-notes

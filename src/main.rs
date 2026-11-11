@@ -1,4 +1,9 @@
 mod api;
+#[cfg(target_os = "macos")]
+mod appkit;
+// Плеер архива сейчас реализован только на macOS; на остальных
+// платформах модуль не используется — не ругаемся на dead_code.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod archive;
 mod input;
 mod model;
@@ -9,11 +14,12 @@ use api::{DkeysApi, normalize_phone};
 #[cfg(target_os = "macos")]
 use archive::ArchiveControl;
 use gpui::{
-    App, Application, BorderStyle, Bounds, Context, Corners, Edges, ElementId, Entity, Focusable,
-    FontWeight, KeyBinding, MouseButton, PaintQuad, Pixels, SharedString, Stateful,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, actions, canvas, div, img, point,
-    prelude::*, px, rgb, rgba, size, white,
+    App, Application, Bounds, Context, ElementId, Entity, Focusable, FontWeight, KeyBinding,
+    MouseButton, SharedString, Stateful, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    actions, div, img, prelude::*, px, rgb, rgba, size, white,
 };
+#[cfg(target_os = "macos")]
+use gpui::{BorderStyle, Corners, Edges, PaintQuad, Pixels, canvas, point};
 use input::TextInput;
 use model::{ArchiveLink, Broadcast, Key, Session};
 use native_webrtc::NativeWebView;
@@ -78,14 +84,23 @@ struct DKeysApp {
     archive_task: Option<String>,
     #[cfg(target_os = "macos")]
     archive_control: Option<archive::macos::AvPlayerControl>,
+    #[cfg(target_os = "macos")]
     archive_events: Option<std::sync::mpsc::Receiver<archive::PlayerEvent>>,
+    #[cfg(target_os = "macos")]
     archive_playlist: Option<archive::ArchivePlaylist>,
+    #[cfg(target_os = "macos")]
     archive_position: f64,
+    #[cfg(target_os = "macos")]
     archive_duration: f64,
+    #[cfg(target_os = "macos")]
     archive_paused: bool,
+    #[cfg(target_os = "macos")]
     archive_speed: f32,
+    #[cfg(target_os = "macos")]
     archive_error: Option<String>,
+    #[cfg(target_os = "macos")]
     archive_loading: bool,
+    #[cfg(target_os = "macos")]
     timeline_bounds: std::sync::Arc<std::sync::Mutex<Option<Bounds<Pixels>>>>,
     busy: Option<Busy>,
     status: Option<Status>,
@@ -133,14 +148,23 @@ impl DKeysApp {
             archive_task: None,
             #[cfg(target_os = "macos")]
             archive_control: None,
+            #[cfg(target_os = "macos")]
             archive_events: None,
+            #[cfg(target_os = "macos")]
             archive_playlist: None,
+            #[cfg(target_os = "macos")]
             archive_position: 0.0,
+            #[cfg(target_os = "macos")]
             archive_duration: 0.0,
+            #[cfg(target_os = "macos")]
             archive_paused: false,
+            #[cfg(target_os = "macos")]
             archive_speed: 1.0,
+            #[cfg(target_os = "macos")]
             archive_error: None,
+            #[cfg(target_os = "macos")]
             archive_loading: false,
+            #[cfg(target_os = "macos")]
             timeline_bounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
             busy: None,
             status: None,
@@ -488,28 +512,37 @@ impl DKeysApp {
                 .background_executor()
                 .spawn(async move { api.online_archive_link(&session, &camera, &date_view) })
                 .await;
-            this.update(cx, |app, cx| {
-                app.busy = None;
-                match result {
-                    Ok(link) => {
-                        let entity_id = cx.entity_id();
-                        weak_window
-                            .update(cx, |_, window, cx| {
-                                app.open_archive_view(
-                                    code.clone(),
-                                    input_date.clone(),
-                                    link,
-                                    window,
-                                    entity_id,
-                                    cx,
-                                );
-                            })
-                            .ok();
-                    }
-                    Err(error) => app.set_status(format!("{error:#}"), true, cx),
+            match result {
+                Ok(link) => {
+                    this.update(cx, |app, cx| {
+                        app.busy = None;
+                        cx.notify();
+                    })
+                    .ok();
+                    weak_window
+                        .update(cx, |view, window, cx| {
+                            if let Ok(entity) = view.downcast::<DKeysApp>() {
+                                entity.update(cx, |app, cx| {
+                                    app.open_archive_view(
+                                        code.clone(),
+                                        input_date.clone(),
+                                        link,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }
+                        })
+                        .ok();
                 }
-            })
-            .ok();
+                Err(error) => {
+                    this.update(cx, |app, cx| {
+                        app.busy = None;
+                        app.set_status(format!("{error:#}"), true, cx);
+                    })
+                    .ok();
+                }
+            }
         })
         .detach();
     }
@@ -520,24 +553,26 @@ impl DKeysApp {
         date: String,
         link: ArchiveLink,
         window: &mut Window,
-        entity_id: gpui::EntityId,
-        cx: &mut App,
+        cx: &mut Context<Self>,
     ) {
         self.stop_webrtc();
         self.archive_task = Some(link.task.clone());
-        self.archive_loading = true;
-        self.archive_error = None;
-        self.archive_playlist = None;
-        self.archive_position = 0.0;
-        self.archive_duration = 0.0;
-        self.archive_paused = false;
-        self.archive_speed = 1.0;
+        #[cfg(target_os = "macos")]
+        {
+            self.archive_loading = true;
+            self.archive_error = None;
+            self.archive_playlist = None;
+            self.archive_position = 0.0;
+            self.archive_duration = 0.0;
+            self.archive_paused = false;
+            self.archive_speed = 1.0;
+        }
         self.screen = Screen::ArchiveView {
             code: code.clone(),
             date: date.clone(),
         };
         self.status = None;
-        cx.notify(entity_id);
+        cx.notify();
 
         #[cfg(not(target_os = "macos"))]
         {
@@ -545,17 +580,14 @@ impl DKeysApp {
             match native_webrtc::attach(window, &link.authenticated_url()) {
                 Ok(view) => {
                     self.native_webrtc = Some(view);
-                    self.archive_loading = false;
-                    cx.notify(entity_id);
+                    cx.notify();
                 }
                 Err(error) => {
                     let api = self.api.clone();
                     std::thread::spawn(move || {
                         let _ = api.close_archive_session(&task);
                     });
-                    self.archive_loading = false;
-                    self.archive_error = Some(error);
-                    cx.notify(entity_id);
+                    self.set_status(error, true, cx);
                 }
             }
         }
@@ -574,10 +606,11 @@ impl DKeysApp {
             let initial_position = seconds_since_midnight(&date);
             let api = self.api.clone();
             let weak_window = window.window_handle();
+            let fetch_url = playlist_url.clone();
             cx.spawn(async move |this, cx| {
                 let playlist_text = cx
                     .background_executor()
-                    .spawn(async move { api.archive_playlist_text(&playlist_url) })
+                    .spawn(async move { api.archive_playlist_text(&fetch_url) })
                     .await;
                 this.update(cx, |app, cx| {
                     app.archive_loading = false;
@@ -1941,12 +1974,10 @@ impl DKeysApp {
                     .bg(white())
                     .border_b_1()
                     .border_color(rgb(BORDER))
-                    .child(
-                        text_button("close-camera", "← Назад").on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|app, _, _, cx| app.close_camera(cx)),
-                        ),
-                    )
+                    .child(text_button("close-camera", "← Назад").on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|app, _, _, cx| app.close_camera(cx)),
+                    ))
                     .child(
                         div()
                             .text_xl()
@@ -1955,12 +1986,7 @@ impl DKeysApp {
                             .child(title),
                     )
                     .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .child("Онлайн-архив"),
-                    ),
+                    .child(div().text_sm().text_color(rgb(MUTED)).child("Онлайн-архив")),
             )
             .child(
                 div()
@@ -2002,20 +2028,18 @@ impl DKeysApp {
                                         .text_color(rgba(0xffb4b4ff))
                                         .child(text),
                                 )
-                                .child(
-                                    text_button("retry-archive", "Повторить").on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|app, _, window, cx| {
-                                            let code = match &app.screen {
-                                                Screen::ArchiveView { code, .. } => code.clone(),
-                                                _ => return,
-                                            };
-                                            app.stop_webrtc();
-                                            app.screen = Screen::ArchivePicker(code);
-                                            app.open_archive(window, cx);
-                                        }),
-                                    ),
-                                ),
+                                .child(text_button("retry-archive", "Повторить").on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|app, _, window, cx| {
+                                        let code = match &app.screen {
+                                            Screen::ArchiveView { code, .. } => code.clone(),
+                                            _ => return,
+                                        };
+                                        app.stop_webrtc();
+                                        app.screen = Screen::ArchivePicker(code);
+                                        app.open_archive(window, cx);
+                                    }),
+                                )),
                         )
                     }),
             );
@@ -2027,79 +2051,67 @@ impl DKeysApp {
                 .flex()
                 .items_center()
                 .gap_3()
-                .child(
-                    player_button(if paused { "⏵" } else { "⏸" })
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|app, _, _, cx| {
-                                if let Some(control) = app.archive_control.as_mut() {
-                                    if app.archive_paused {
-                                        control.play();
-                                    } else {
-                                        control.pause();
-                                    }
-                                }
-                                cx.notify();
-                            }),
-                        ),
-                )
-                .child(
-                    player_pill("−15 с").on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|app, _, _, cx| {
-                            let target = (app.archive_position - 15.0).max(0.0);
-                            if let Some(control) = app.archive_control.as_mut() {
-                                control.seek(target);
-                                app.archive_position = target;
+                .child(player_button(if paused { "⏵" } else { "⏸" }).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|app, _, _, cx| {
+                        if let Some(control) = app.archive_control.as_mut() {
+                            if app.archive_paused {
+                                control.play();
+                            } else {
+                                control.pause();
                             }
-                            cx.notify();
-                        }),
-                    ),
-                )
-                .child(
-                    player_pill("+15 с").on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|app, _, _, cx| {
-                            let target = (app.archive_position + 15.0)
-                                .min(app.archive_duration.max(0.0));
-                            if let Some(control) = app.archive_control.as_mut() {
-                                control.seek(target);
-                                app.archive_position = target;
-                            }
-                            cx.notify();
-                        }),
-                    ),
-                )
-                .child(
-                    player_pill(&format!("×{speed}")).on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|app, _, _, cx| {
-                            const SPEEDS: [f32; 4] = [1.0, 1.5, 2.0, 4.0];
-                            let next = SPEEDS
-                                .iter()
-                                .find(|&&value| value > app.archive_speed)
-                                .copied()
-                                .unwrap_or(SPEEDS[0]);
-                            app.archive_speed = next;
-                            if let Some(control) = app.archive_control.as_mut() {
-                                control.set_speed(next);
-                            }
-                            cx.notify();
-                        }),
-                    ),
-                )
+                        }
+                        cx.notify();
+                    }),
+                ))
+                .child(player_pill("−15 с").on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|app, _, _, cx| {
+                        let target = (app.archive_position - 15.0).max(0.0);
+                        if let Some(control) = app.archive_control.as_mut() {
+                            control.seek(target);
+                            app.archive_position = target;
+                        }
+                        cx.notify();
+                    }),
+                ))
+                .child(player_pill("+15 с").on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|app, _, _, cx| {
+                        let target =
+                            (app.archive_position + 15.0).min(app.archive_duration.max(0.0));
+                        if let Some(control) = app.archive_control.as_mut() {
+                            control.seek(target);
+                            app.archive_position = target;
+                        }
+                        cx.notify();
+                    }),
+                ))
+                .child(player_pill(&format!("×{speed}")).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|app, _, _, cx| {
+                        const SPEEDS: [f32; 4] = [1.0, 1.5, 2.0, 4.0];
+                        let next = SPEEDS
+                            .iter()
+                            .find(|&&value| value > app.archive_speed)
+                            .copied()
+                            .unwrap_or(SPEEDS[0]);
+                        app.archive_speed = next;
+                        if let Some(control) = app.archive_control.as_mut() {
+                            control.set_speed(next);
+                        }
+                        cx.notify();
+                    }),
+                ))
                 .child(div().flex_1())
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(TEXT))
-                        .child(format!(
-                            "{} / {}",
-                            archive::format_time(position),
-                            archive::format_time(duration)
-                        )),
-                );
-            content = content.child(controls).child(self.render_archive_timeline(cx));
+                .child(div().text_sm().text_color(rgb(TEXT)).child(format!(
+                    "{} / {}",
+                    archive::format_time(position),
+                    archive::format_time(duration)
+                )));
+            content = content
+                .child(controls)
+                .child(self.render_archive_timeline(cx));
         }
 
         div()
@@ -2138,9 +2150,10 @@ impl DKeysApp {
                     let bar_height = px(8.0);
                     let bar_y = bounds.center().y - bar_height / 2.0;
                     for segment in &playlist.segments {
-                        let x = bounds.left() + bounds.width() * (segment.start / duration) as f32;
-                        let width = (bounds.width() * (segment.duration / duration) as f32)
-                            .max(px(1.0));
+                        let x =
+                            bounds.left() + bounds.size.width * (segment.start / duration) as f32;
+                        let width =
+                            (bounds.size.width * (segment.duration / duration) as f32).max(px(1.0));
                         let color = match segment.color {
                             archive::SegmentColor::Recording => rgb(0xe5484d),
                             archive::SegmentColor::Placeholder => rgb(0x2b3444),
@@ -2156,7 +2169,7 @@ impl DKeysApp {
                         });
                     }
                     let thumb_x = bounds.left()
-                        + bounds.width() * ((position / duration).clamp(0.0, 1.0) as f32);
+                        + bounds.size.width * ((position / duration).clamp(0.0, 1.0) as f32);
                     window.paint_quad(PaintQuad {
                         bounds: Bounds::new(
                             point(thumb_x - px(7.0), bounds.center().y - px(7.0)),
@@ -2172,19 +2185,19 @@ impl DKeysApp {
             ))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|app, event, _, cx| {
-                    let bounds = app.timeline_bounds.lock().unwrap().clone();
-                    if let Some(bounds) = bounds {
-                        if bounds.width() > px(0.0) && app.archive_duration > 0.0 {
-                            let fraction = ((event.position.x - bounds.left()) / bounds.width())
-                                .clamp(0.0, 1.0);
-                            let target = fraction * app.archive_duration;
-                            if let Some(control) = app.archive_control.as_mut() {
-                                control.seek(target);
-                                app.archive_position = target;
-                            }
-                            cx.notify();
+                cx.listener(|app, event: &gpui::MouseDownEvent, _, cx| {
+                    if let Some(bounds) = *app.timeline_bounds.lock().unwrap()
+                        && bounds.size.width > px(0.0)
+                        && app.archive_duration > 0.0
+                    {
+                        let fraction = ((event.position.x - bounds.left()) / bounds.size.width)
+                            .clamp(0.0, 1.0);
+                        let target = f64::from(fraction) * app.archive_duration;
+                        if let Some(control) = app.archive_control.as_mut() {
+                            control.seek(target);
+                            app.archive_position = target;
                         }
+                        cx.notify();
                     }
                 }),
             )
@@ -2488,6 +2501,7 @@ fn text_button(id: &'static str, label: &'static str) -> Stateful<gpui::Div> {
         .child(label)
 }
 
+#[cfg(target_os = "macos")]
 fn player_button(label: &'static str) -> Stateful<gpui::Div> {
     div()
         .id("player-transport")
@@ -2505,6 +2519,7 @@ fn player_button(label: &'static str) -> Stateful<gpui::Div> {
         .child(label)
 }
 
+#[cfg(target_os = "macos")]
 fn player_pill(label: &str) -> Stateful<gpui::Div> {
     div()
         .id("player-pill")
@@ -2522,6 +2537,7 @@ fn player_pill(label: &str) -> Stateful<gpui::Div> {
         .child(label.to_owned())
 }
 
+#[cfg(target_os = "macos")]
 fn seconds_since_midnight(date: &str) -> f64 {
     let time = date.split(' ').nth(1).unwrap_or("");
     let mut parts = time.split(':');

@@ -198,14 +198,15 @@ impl DkeysApi {
             .ok_or_else(|| anyhow!("Сервер не вернул ссылку на онлайн-архив"))
     }
 
+    #[cfg(target_os = "macos")]
     pub fn archive_playlist_text(&self, url: &str) -> Result<String> {
         for _ in 1..=6 {
-            if let Ok(response) = self.client.get(url).send() {
-                if response.status().is_success() {
-                    return response
-                        .text()
-                        .context("Не удалось прочитать плейлист архива");
-                }
+            if let Ok(response) = self.client.get(url).send()
+                && response.status().is_success()
+            {
+                return response
+                    .text()
+                    .context("Не удалось прочитать плейлист архива");
             }
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
