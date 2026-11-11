@@ -36,6 +36,12 @@ unsafe impl objc::Encode for CMTime {
 
 unsafe extern "C" {
     fn CMTimeMakeWithSeconds(seconds: f64, preferred_timescale: i32) -> CMTime;
+    #[link_name = "_dispatch_main_q"]
+    static DISPATCH_MAIN_Q: Object;
+}
+
+fn main_dispatch_queue() -> *mut Object {
+    (std::ptr::addr_of!(DISPATCH_MAIN_Q)).cast_mut()
 }
 
 const AV_PLAYER_ITEM_STATUS_READY: isize = 1;
@@ -210,8 +216,7 @@ pub fn attach(
         let _: () = msg_send![asset, release];
         let player: *mut Object = msg_send![class!(AVPlayer), alloc];
         let player: *mut Object = msg_send![player, initWithPlayerItem: item];
-        let layer: *mut Object = msg_send![class!(AVPlayerLayer), alloc];
-        let layer: *mut Object = msg_send![layer, initWithPlayer: player];
+        let layer: *mut Object = msg_send![class!(AVPlayerLayer), playerLayerWithPlayer: player];
         let gravity = NSString::from_str("AVLayerVideoGravityResizeAspect");
         let _: () = msg_send![layer, setVideoGravity: gravity];
         let host_layer: *mut Object = msg_send![host_view, layer];
@@ -223,7 +228,6 @@ pub fn attach(
         layer_frame.origin.y = 0.0;
         let _: () = msg_send![layer, setFrame: layer_frame];
         let _: () = msg_send![layer, setAutoresizingMask: 18usize];
-        let _: () = msg_send![layer, release];
 
         let alive = Arc::new(AtomicBool::new(true));
         let started = Arc::new(AtomicBool::new(false));
@@ -265,11 +269,11 @@ pub fn attach(
             });
         })
         .copy();
-        let interval = CMTimeMakeWithSeconds(0.5, 1);
+        let interval = CMTimeMakeWithSeconds(0.5, 600);
         let observer: *mut Object = msg_send![
             player,
             addPeriodicTimeObserverForInterval: interval
-            queue: std::ptr::null_mut::<Object>()
+            queue: main_dispatch_queue()
             usingBlock: &*block
         ];
 
