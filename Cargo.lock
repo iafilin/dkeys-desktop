@@ -1551,7 +1551,6 @@ name = "dkeys-desktop"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "block",
  "core-graphics-types 0.2.0",
  "directories",
  "gpui",

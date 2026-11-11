@@ -27,7 +27,6 @@ unicode-segmentation = "1.12"
 urlencoding = "2.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-block = "0.1"
 core-graphics-types = "0.2.0"
 objc = "0.2.7"
 objc-foundation = "0.1.1"
